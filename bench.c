@@ -10,7 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define NTEST 11
+#define NTEST 17
 
 struct Test {
     const char *id;
@@ -34,12 +34,19 @@ static struct Test T[NTEST] = {
     {"thr4", "4-thread int", "Mops", 0, 1, 0, 0},
     {"fbfill", "fb clear+flip", "fps", 0, 1, 0, 0},
     {"fbpx", "fb px()", "Mpx/s", 0, 0, 0, 0},
+    {"crc", "crc32 4MB", "MB/s", 0, 1, 0, 0},
+    {"stos", "scatter write", "MB/s", 0, 1, 0, 0},
+    {"idiv", "u64 div", "Mops", 0, 1, 0, 0},
+    {"sqrt", "sqrt+log", "Mops", 0, 1, 0, 0},
+    {"popc", "popcount", "Mops", 0, 1, 0, 0},
+    {"saxpy", "saxpy 512k", "Mflop", 0, 1, 0, 0},
 };
 
 static double duration = 1.0;
 static int threads = 4;
-static int sel, want_quit;
-static char msg[96] = "space on/off  enter run  a all  w write cfg  x quit";
+static int sel, want_quit, forever;
+static volatile int stopflag;
+static char msg[96] = "enter timed  i infinite  space on/off  a all  x quit";
 
 static uint16_t Cbg, Cfg, Cacc, Cdim;
 static struct termios oldt;
@@ -127,6 +134,26 @@ static double now_s(void)
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
 
+static int keyed(void)
+{
+    unsigned char b;
+    return read(0, &b, 1) > 0;
+}
+
+static int done(double t0, double *t)
+{
+    *t = now_s() - t0;
+    if (keyed()) {
+        stopflag = 1;
+        return 1;
+    }
+    if (stopflag)
+        return 1;
+    if (!forever && *t >= duration)
+        return 1;
+    return 0;
+}
+
 static void io_open(void)
 {
     struct termios t;
@@ -171,7 +198,7 @@ static double bench_int64(void)
         }
         n += 20000;
         t = now_s() - t0;
-    } while (t < duration);
+    } while (!done(t0, &t));
     (void)a;
     (void)b;
     (void)c;
@@ -191,7 +218,7 @@ static double bench_float(void)
         }
         n += 3000;
         t = now_s() - t0;
-    } while (t < duration);
+    } while (!done(t0, &t));
     (void)y;
     return n / t / 1e6;
 }
@@ -212,7 +239,7 @@ static double bench_memcpy(void)
         memcpy(b, a, n);
         mb += n / (1024.0 * 1024.0);
         t = now_s() - t0;
-    } while (t < duration);
+    } while (!done(t0, &t));
     free(a);
     free(b);
     return mb / t;
@@ -236,7 +263,7 @@ static double bench_walk(void)
             hits++;
         }
         t = now_s() - t0;
-    } while (t < duration);
+    } while (!done(t0, &t));
     free(p);
     return (t / (double)hits) * 1e9;
 }
@@ -272,7 +299,7 @@ static double bench_gemm(void)
             }
         reps++;
         t = now_s() - t0;
-    } while (t < duration);
+    } while (!done(t0, &t));
     flop = (double)reps * 2.0 * N * N * N;
     free(A);
     free(B);
@@ -303,7 +330,7 @@ static double bench_mandel(void)
                 pix++;
             }
         t = now_s() - t0;
-    } while (t < duration);
+    } while (!done(t0, &t));
     return pix / t / 1000.0;
 }
 
@@ -311,7 +338,7 @@ static double bench_sieve(void)
 {
     const int N = 2000000;
     char *c = malloc((size_t)N);
-    double t0, t, done = 0;
+    double t0, t, acc = 0;
     int p, i;
     if (!c)
         return 0;
@@ -323,11 +350,11 @@ static double bench_sieve(void)
             if (c[p])
                 for (i = p * p; i < N; i += p)
                     c[i] = 0;
-        done += N;
+        acc += N;
         t = now_s() - t0;
-    } while (t < duration);
+    } while (!done(t0, &t));
     free(c);
-    return done / t / 1e6;
+    return acc / t / 1e6;
 }
 
 static int icmp(const void *a, const void *b)
@@ -352,7 +379,7 @@ static double bench_qsort(void)
         qsort(a, (size_t)N, sizeof *a, icmp);
         items += N;
         t = now_s() - t0;
-    } while (t < duration);
+    } while (!done(t0, &t));
     free(a);
     return items / t / 1000.0;
 }
@@ -367,7 +394,7 @@ static void *thr_body(void *arg)
     struct Thr *th = arg;
     volatile unsigned long long a = 1, b = 9;
     unsigned long n = 0;
-    double t0 = now_s(), t;
+    double t0 = now_s(), t = 0;
     do {
         int i;
         for (i = 0; i < 20000; i++) {
@@ -376,10 +403,10 @@ static void *thr_body(void *arg)
         }
         n += 20000;
         t = now_s() - t0;
-    } while (t < duration);
+    } while (!stopflag && (forever || t < duration));
     (void)b;
     th->n = n;
-    th->t = t;
+    th->t = t > 0 ? t : 1e-6;
     return NULL;
 }
 
@@ -388,11 +415,18 @@ static double bench_thr(void)
     pthread_t id[4];
     struct Thr th[4];
     int i, nt = threads;
-    double sum = 0;
+    double sum = 0, t0 = now_s();
     if (nt > 4)
         nt = 4;
     for (i = 0; i < nt; i++)
         pthread_create(&id[i], NULL, thr_body, &th[i]);
+    while (!stopflag) {
+        if (keyed())
+            stopflag = 1;
+        if (!forever && now_s() - t0 >= duration)
+            stopflag = 1;
+        usleep(20000);
+    }
     for (i = 0; i < nt; i++) {
         pthread_join(id[i], NULL);
         sum += th[i].n / th[i].t;
@@ -411,7 +445,7 @@ static double bench_fill(void)
         frames++;
         t = now_s() - t0;
         c = (uint16_t)(c + 32);
-    } while (t < duration);
+    } while (!done(t0, &t));
     return frames / t;
 }
 
@@ -426,14 +460,150 @@ static double bench_px(void)
                 px(x + 8, y + 20, 0x07e0);
         n += 64ul * 128ul;
         t = now_s() - t0;
-    } while (t < duration * 0.8);
+    } while (!done(t0, &t));
     fb_flip();
     return n / t / 1e6;
 }
 
+static unsigned crc32_buf(const unsigned char *p, size_t n)
+{
+    unsigned c = 0xffffffffu;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        int b;
+        c ^= p[i];
+        for (b = 0; b < 8; b++)
+            c = (c >> 1) ^ (0xedb88320u & -(c & 1u));
+    }
+    return ~c;
+}
+
+static double bench_crc(void)
+{
+    const size_t n = 4 * 1024 * 1024;
+    unsigned char *p = malloc(n);
+    double t0, t, mb = 0;
+    unsigned z = 0;
+    if (!p)
+        return 0;
+    memset(p, 0x3c, n);
+    t0 = now_s();
+    do {
+        z ^= crc32_buf(p, n);
+        mb += n / (1024.0 * 1024.0);
+    } while (!done(t0, &t));
+    free(p);
+    (void)z;
+    return mb / t;
+}
+
+static double bench_stos(void)
+{
+    const int n = 1024 * 1024;
+    unsigned *p = malloc((size_t)n * sizeof *p);
+    unsigned long hits = 0;
+    unsigned idx = 1;
+    double t0, t;
+    int i;
+    if (!p)
+        return 0;
+    memset(p, 0, (size_t)n * sizeof *p);
+    t0 = now_s();
+    do {
+        for (i = 0; i < 40000; i++) {
+            idx = idx * 1664525u + 1013904223u;
+            p[idx % (unsigned)n] = idx;
+            hits++;
+        }
+    } while (!done(t0, &t));
+    free(p);
+    return (hits * 4.0 / (1024.0 * 1024.0)) / t;
+}
+
+static double bench_idiv(void)
+{
+    volatile unsigned long long a = 0x9e3779b97f4a7c15ull, b = 17, c = 1;
+    unsigned long n = 0;
+    double t0 = now_s(), t;
+    do {
+        int i;
+        for (i = 0; i < 8000; i++) {
+            a = a * 6364136223846793005ull + 1;
+            c = a / (b | 1);
+            b = (b + c) | 1;
+        }
+        n += 8000;
+    } while (!done(t0, &t));
+    (void)c;
+    return n / t / 1e6;
+}
+
+static double bench_sqrt(void)
+{
+    volatile double x = 1.1, y = 2.0;
+    unsigned long n = 0;
+    double t0 = now_s(), t;
+    do {
+        int i;
+        for (i = 0; i < 2000; i++) {
+            x = sqrt(x * 1.0000003 + 1.0);
+            y = log(y + 1.0001);
+        }
+        n += 2000;
+    } while (!done(t0, &t));
+    (void)y;
+    return n / t / 1e6;
+}
+
+static double bench_popc(void)
+{
+    volatile unsigned long long a = 1, s = 0;
+    unsigned long n = 0;
+    double t0 = now_s(), t;
+    do {
+        int i;
+        for (i = 0; i < 20000; i++) {
+            a = a * 6364136223846793005ull + 1;
+            s += (unsigned)__builtin_popcountll(a);
+        }
+        n += 20000;
+    } while (!done(t0, &t));
+    (void)s;
+    return n / t / 1e6;
+}
+
+static double bench_saxpy(void)
+{
+    const int n = 512 * 1024;
+    float *x = malloc((size_t)n * sizeof *x);
+    float *y = malloc((size_t)n * sizeof *y);
+    float a = 1.0001f;
+    double t0, t, flop = 0;
+    int i;
+    if (!x || !y) {
+        free(x);
+        free(y);
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        x[i] = 0.001f * (float)i;
+        y[i] = 1.0f;
+    }
+    t0 = now_s();
+    do {
+        for (i = 0; i < n; i++)
+            y[i] = a * x[i] + y[i];
+        flop += 2.0 * n;
+    } while (!done(t0, &t));
+    free(x);
+    free(y);
+    return flop / t / 1e6;
+}
+
 static double (*fn[NTEST])(void) = {
     bench_int64, bench_float, bench_memcpy, bench_walk, bench_gemm,
-    bench_mandel, bench_sieve, bench_qsort, bench_thr, bench_fill, bench_px
+    bench_mandel, bench_sieve, bench_qsort, bench_thr, bench_fill, bench_px,
+    bench_crc, bench_stos, bench_idiv, bench_sqrt, bench_popc, bench_saxpy
 };
 
 static void draw(void);
@@ -447,11 +617,16 @@ static void run_one(int i)
         snprintf(msg, sizeof msg, "%s off — space to enable", T[i].id);
         return;
     }
-    snprintf(msg, sizeof msg, "running %s …", T[i].id);
+    stopflag = 0;
+    snprintf(msg, sizeof msg, forever ? "INFINITE %s — tap any key" : "running %s …",
+             T[i].id);
     draw();
     T[i].score = fn[i]();
     T[i].have = 1;
-    snprintf(msg, sizeof msg, "%s  %.3f %s", T[i].id, T[i].score, T[i].unit);
+    if (T[i].score < 0)
+        T[i].score = 0;
+    snprintf(msg, sizeof msg, "%s  %.3f %s%s", T[i].id, T[i].score, T[i].unit,
+             forever ? "  (stopped)" : "");
     snprintf(line, sizeof line, "%04d-%02d-%02d %02d:%02d  %s  %.4f  %s",
              tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
              tm->tm_hour, tm->tm_min, T[i].id, T[i].score, T[i].unit);
@@ -460,10 +635,12 @@ static void run_one(int i)
 
 static void run_all(void)
 {
-    int i;
+    int i, saved = forever;
+    forever = 0;
     for (i = 0; i < NTEST; i++)
         if (T[i].on)
             run_one(i);
+    forever = saved;
     snprintf(msg, sizeof msg, "all on tests done  dt=%.2fs", duration);
 }
 
@@ -473,11 +650,12 @@ static void draw(void)
     char buf[64];
     fb_clear(Cbg);
     text(2, 2, "cBench", Cacc);
-    snprintf(buf, sizeof buf, "dt=%.2fs thr=%d", duration, threads);
-    text(56, 2, buf, Cdim);
+    snprintf(buf, sizeof buf, "dt=%.2fs thr=%d%s", duration, threads,
+             forever ? " INF" : "");
+    text(50, 2, buf, Cdim);
     text(2, 12, "id        on   score", Cdim);
     for (i = 0; i < NTEST; i++) {
-        int y = 22 + i * 10;
+        int y = 20 + i * 9;
         char mark = T[i].on ? 'x' : ' ';
         char cur = (i == sel) ? '>' : ' ';
         snprintf(buf, sizeof buf, "%c [%c] %-8s", cur, mark, T[i].id);
@@ -490,7 +668,7 @@ static void draw(void)
         (void)row;
     }
     text(2, (int)FB_H - 20, msg, Cfg);
-    text(2, (int)FB_H - 10, "space toggle  enter  a=all  w=cfg  x=quit", Cdim);
+    text(2, (int)FB_H - 10, "enter timed  i=forever  space  a=all  x=quit", Cdim);
     fb_flip();
 }
 
@@ -524,8 +702,14 @@ int main(void)
             cfg_save();
         else if (b[0] == 'a' || b[0] == 'A')
             run_all();
-        else if (b[0] == 13 || b[0] == 10)
+        else if (b[0] == 13 || b[0] == 10) {
+            forever = 0;
             run_one(sel);
+        } else if (b[0] == 'i' || b[0] == 'I') {
+            forever = 1;
+            run_one(sel);
+            forever = 0;
+        }
         else if (b[0] == '+' ) {
             duration += 0.2;
             if (duration > 8)
